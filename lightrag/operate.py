@@ -31,7 +31,7 @@ from .base import (
 )
 from .prompt import GRAPH_FIELD_SEP, PROMPTS
 import time
-
+from .token_utils import TokenCounter
 
 def chunking_by_token_size(
     content: str,
@@ -565,7 +565,7 @@ async def extract_entities(
 
 
 async def kg_query(
-    query,
+    query: str,
     knowledge_graph_inst: BaseGraphStorage,
     entities_vdb: BaseVectorStorage,
     relationships_vdb: BaseVectorStorage,
@@ -574,6 +574,12 @@ async def kg_query(
     global_config: dict,
     hashing_kv: BaseKVStorage = None,
 ) -> str:
+    # 初始化 TokenCounter
+    token_counter = TokenCounter(model_name=global_config.get("llm_model", "gpt-4o"))
+
+    # 計算查詢的 Token 數量
+    token_counter.update_query_tokens(query)
+
     # Handle cache
     use_model_func = global_config["llm_model_func"]
     args_hash = compute_args_hash(query_param.mode, query)
@@ -656,6 +662,10 @@ async def kg_query(
         query_param,
     )
 
+    # 在檢索相關文本塊後計算 Token 數量
+    if context:
+        token_counter.update_retrieved_data_tokens([context])
+
     if query_param.only_need_context:
         return context
     if context is None:
@@ -664,13 +674,25 @@ async def kg_query(
     sys_prompt = sys_prompt_temp.format(
         context_data=context, response_type=query_param.response_type
     )
+
+    # 計算系統提示的 Token 數量
+    token_counter.update_system_prompt_tokens(sys_prompt)
+
     if query_param.only_need_prompt:
         return sys_prompt
+
+    # 計算完整提示的 Token 數量
+    full_prompt = f"{sys_prompt}\n\n{query}"
+    token_counter.update_total_prompt_tokens(full_prompt)
+
+    # 獲取 LLM 回應
     response = await use_model_func(
         query,
         system_prompt=sys_prompt,
         stream=query_param.stream,
     )
+
+    # 處理回應
     if isinstance(response, str) and len(response) > len(sys_prompt):
         response = (
             response.replace(sys_prompt, "")
@@ -682,7 +704,13 @@ async def kg_query(
             .strip()
         )
 
-    # Save to cache
+    # 計算回應的 Token 數量
+    token_counter.update_completion_tokens(response)
+
+    # 獲取 Token 統計信息
+    token_stats = token_counter.get_stats()
+
+    # 保存到緩存
     await save_to_cache(
         hashing_kv,
         CacheData(
@@ -693,9 +721,27 @@ async def kg_query(
             min_val=min_val,
             max_val=max_val,
             mode=query_param.mode,
+            token_stats=token_stats,  # 添加 Token 統計信息
         ),
     )
-    return response
+
+    if isinstance(response, str):
+        if query_param.stream:
+            # 如果是流式模式，返回異步迭代器
+            async def wrapped_generator():
+                yield response
+                yield {"token_stats": token_stats}
+            return wrapped_generator()
+        else:
+            # 如果不是流式模式，返回字典
+            return {"response": response, "token_stats": token_stats}
+    else:
+        # 如果已經是異步迭代器，包裝它以在最後添加 Token 統計信息
+        async def wrapped_generator():
+            async for chunk in response:
+                yield chunk
+            yield {"token_stats": token_stats}
+        return wrapped_generator()
 
 
 async def kg_query_with_keywords(
@@ -850,7 +896,7 @@ async def extract_keywords_only(
         hashing_kv, args_hash, text, param.mode
     )
     if cached_response is not None:
-        # parse the cached_response if it’s JSON containing keywords
+        # parse the cached_response if it's JSON containing keywords
         # or simply return (hl_keywords, ll_keywords) from cached
         # Assuming cached_response is in the same JSON structure:
         match = re.search(r"\{.*\}", cached_response, re.DOTALL)
@@ -1398,13 +1444,19 @@ def combine_contexts(entities, relationships, sources):
 
 
 async def naive_query(
-    query,
+    query: str,
     chunks_vdb: BaseVectorStorage,
     text_chunks_db: BaseKVStorage[TextChunkSchema],
     query_param: QueryParam,
     global_config: dict,
     hashing_kv: BaseKVStorage = None,
 ):
+    # 初始化 TokenCounter
+    token_counter = TokenCounter(model_name=global_config.get("llm_model", "gpt-4o"))
+
+    # 計算查詢的 Token 數量
+    token_counter.update_query_tokens(query)
+
     # Handle cache
     use_model_func = global_config["llm_model_func"]
     args_hash = compute_args_hash(query_param.mode, query)
@@ -1443,6 +1495,10 @@ async def naive_query(
     logger.info(f"Truncate {len(chunks)} to {len(maybe_trun_chunks)} chunks")
     section = "\n--New Chunk--\n".join([c["content"] for c in maybe_trun_chunks])
 
+    # 計算檢索數據的 Token 數量
+    chunk_texts = [c["content"] for c in maybe_trun_chunks]
+    token_counter.update_retrieved_data_tokens(chunk_texts)
+
     if query_param.only_need_context:
         return section
 
@@ -1451,8 +1507,15 @@ async def naive_query(
         content_data=section, response_type=query_param.response_type
     )
 
+    # 計算系統提示的 Token 數量
+    token_counter.update_system_prompt_tokens(sys_prompt)
+
     if query_param.only_need_prompt:
         return sys_prompt
+
+    # 計算完整提示的 Token 數量
+    full_prompt = f"{sys_prompt}\n\n{query}"
+    token_counter.update_total_prompt_tokens(full_prompt)
 
     response = await use_model_func(
         query,
@@ -1471,6 +1534,12 @@ async def naive_query(
             .strip()
         )
 
+    # 計算回應的 Token 數量
+    token_counter.update_completion_tokens(response)
+
+    # 獲取 Token 統計信息
+    token_stats = token_counter.get_stats()
+
     # Save to cache
     await save_to_cache(
         hashing_kv,
@@ -1482,14 +1551,31 @@ async def naive_query(
             min_val=min_val,
             max_val=max_val,
             mode=query_param.mode,
+            token_stats=token_stats,  # 添加 Token 統計信息
         ),
     )
 
-    return response
+    if isinstance(response, str):
+        if query_param.stream:
+            # 如果是流式模式，返回異步迭代器
+            async def wrapped_generator():
+                yield response
+                yield {"token_stats": token_stats}
+            return wrapped_generator()
+        else:
+            # 如果不是流式模式，返回字典
+            return {"response": response, "token_stats": token_stats}
+    else:
+        # 如果已經是異步迭代器，包裝它以在最後添加 Token 統計信息
+        async def wrapped_generator():
+            async for chunk in response:
+                yield chunk
+            yield {"token_stats": token_stats}
+        return wrapped_generator()
 
 
 async def mix_kg_vector_query(
-    query,
+    query: str,
     knowledge_graph_inst: BaseGraphStorage,
     entities_vdb: BaseVectorStorage,
     relationships_vdb: BaseVectorStorage,
@@ -1507,6 +1593,12 @@ async def mix_kg_vector_query(
     2. Retrieving relevant text chunks through vector similarity
     3. Combining both results for comprehensive answer generation
     """
+    # 初始化 TokenCounter
+    token_counter = TokenCounter(model_name=global_config.get("llm_model", "gpt-4o"))
+
+    # 計算查詢的 Token 數量
+    token_counter.update_query_tokens(query)
+
     # 1. Cache handling
     use_model_func = global_config["llm_model_func"]
     args_hash = compute_args_hash("mix", query)
@@ -1645,6 +1737,14 @@ async def mix_kg_vector_query(
     if query_param.only_need_context:
         return {"kg_context": kg_context, "vector_context": vector_context}
 
+    # 計算檢索數據的 Token 數量
+    retrieved_texts = []
+    if kg_context:
+        retrieved_texts.append(kg_context)
+    if vector_context:
+        retrieved_texts.append(vector_context)
+    token_counter.update_retrieved_data_tokens(retrieved_texts)
+
     # 5. Construct hybrid prompt
     sys_prompt = PROMPTS["mix_rag_response"].format(
         kg_context=kg_context
@@ -1656,8 +1756,15 @@ async def mix_kg_vector_query(
         response_type=query_param.response_type,
     )
 
+    # 計算系統提示的 Token 數量
+    token_counter.update_system_prompt_tokens(sys_prompt)
+
     if query_param.only_need_prompt:
         return sys_prompt
+
+    # 計算完整提示的 Token 數量
+    full_prompt = f"{sys_prompt}\n\n{query}"
+    token_counter.update_total_prompt_tokens(full_prompt)
 
     # 6. Generate response
     response = await use_model_func(
@@ -1666,6 +1773,7 @@ async def mix_kg_vector_query(
         stream=query_param.stream,
     )
 
+    # Clean up the response
     if isinstance(response, str) and len(response) > len(sys_prompt):
         response = (
             response.replace(sys_prompt, "")
@@ -1676,6 +1784,12 @@ async def mix_kg_vector_query(
             .replace("</system>", "")
             .strip()
         )
+
+    # 計算回應的 Token 數量
+    token_counter.update_completion_tokens(response)
+
+    # 獲取 Token 統計信息
+    token_stats = token_counter.get_stats()
 
     # 7. Save cache
     await save_to_cache(
@@ -1688,7 +1802,24 @@ async def mix_kg_vector_query(
             min_val=min_val,
             max_val=max_val,
             mode="mix",
+            token_stats=token_stats,  # 添加 Token 統計信息
         ),
     )
 
-    return response
+    if isinstance(response, str):
+        if query_param.stream:
+            # 如果是流式模式，返回異步迭代器
+            async def wrapped_generator():
+                yield response
+                yield {"token_stats": token_stats}
+            return wrapped_generator()
+        else:
+            # 如果不是流式模式，返回字典
+            return {"response": response, "token_stats": token_stats}
+    else:
+        # 如果已經是異步迭代器，包裝它以在最後添加 Token 統計信息
+        async def wrapped_generator():
+            async for chunk in response:
+                yield chunk
+            yield {"token_stats": token_stats}
+        return wrapped_generator()

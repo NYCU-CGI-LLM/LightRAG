@@ -509,15 +509,28 @@ async def handle_cache(hashing_kv, args_hash, prompt, mode="default"):
     return None, quantized, min_val, max_val
 
 
-@dataclass
 class CacheData:
-    args_hash: str
-    content: str
-    prompt: str
-    quantized: Optional[np.ndarray] = None
-    min_val: Optional[float] = None
-    max_val: Optional[float] = None
-    mode: str = "default"
+    def __init__(
+        self,
+        args_hash,
+        content,
+        prompt,
+        quantized,
+        min_val,
+        max_val,
+        mode,
+        cache_type=None,
+        token_stats=None
+    ):
+        self.args_hash = args_hash
+        self.content = content
+        self.prompt = prompt
+        self.quantized = quantized
+        self.min_val = min_val
+        self.max_val = max_val
+        self.mode = mode
+        self.cache_type = cache_type
+        self.token_stats = token_stats
 
 
 async def save_to_cache(hashing_kv, cache_data: CacheData):
