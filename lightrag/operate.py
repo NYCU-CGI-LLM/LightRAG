@@ -31,7 +31,8 @@ from .base import (
 )
 from .prompt import GRAPH_FIELD_SEP, PROMPTS
 import time
-from .token_utils import TokenCounter
+# from .token_utils import TokenCounter  
+from lightrag.performance_utils import RAGPerformanceTracker
 
 def chunking_by_token_size(
     content: str,
@@ -574,19 +575,24 @@ async def kg_query(
     global_config: dict,
     hashing_kv: BaseKVStorage = None,
 ) -> str:
-    # 初始化 TokenCounter
-    token_counter = TokenCounter(model_name=global_config.get("llm_model", "gpt-4o"))
+    # Initialize RAGPerformanceTracker
+    tracker = RAGPerformanceTracker(model_name=global_config.get("llm_model", "gpt-4o-mini"))
 
-    # 計算查詢的 Token 數量
-    token_counter.update_query_tokens(query)
+    # Start timing the entire process
+    tracker.start_tracking()
+
+    # Track query tokens
+    tracker.update_query_tokens(query)
 
     # Handle cache
     use_model_func = global_config["llm_model_func"]
     args_hash = compute_args_hash(query_param.mode, query)
-    cached_response, quantized, min_val, max_val = await handle_cache(
+    cached_response, quantized, min_val, max_val, mode = await handle_cache(
         hashing_kv, args_hash, query, query_param.mode
     )
     if cached_response is not None:
+        # End tracking early for cached responses
+        tracker.end_tracking()
         return cached_response
 
     example_number = global_config["addon_params"].get("example_number", None)
@@ -603,11 +609,19 @@ async def kg_query(
     # Set mode
     if query_param.mode not in ["local", "global", "hybrid"]:
         logger.error(f"Unknown mode {query_param.mode} in kg_query")
+        tracker.end_tracking()
         return PROMPTS["fail_response"]
+
+    # Start timing for retrieval (includes keyword extraction)
+    tracker.start_retrieve_time()
 
     # LLM generate keywords
     kw_prompt_temp = PROMPTS["keywords_extraction"]
     kw_prompt = kw_prompt_temp.format(query=query, examples=examples, language=language)
+
+    # Track retrieval prompt tokens
+    tracker.update_retrieval_prompt_tokens(kw_prompt)
+
     result = await use_model_func(kw_prompt, keyword_extraction=True)
     logger.info("kw_prompt result:")
     print(result)
@@ -622,16 +636,22 @@ async def kg_query(
             ll_keywords = keywords_data.get("low_level_keywords", [])
         else:
             logger.error("No JSON-like structure found in the result.")
+            tracker.end_retrieve_time()
+            tracker.end_tracking()
             return PROMPTS["fail_response"]
 
     # Handle parsing error
     except json.JSONDecodeError as e:
         print(f"JSON parsing error: {e} {result}")
+        tracker.end_retrieve_time()
+        tracker.end_tracking()
         return PROMPTS["fail_response"]
 
-    # Handdle keywords missing
+    # Handle keywords missing
     if hl_keywords == [] and ll_keywords == []:
         logger.warning("low_level_keywords and high_level_keywords is empty")
+        tracker.end_retrieve_time()
+        tracker.end_tracking()
         return PROMPTS["fail_response"]
     if ll_keywords == [] and query_param.mode in ["local", "hybrid"]:
         logger.warning(
@@ -662,37 +682,46 @@ async def kg_query(
         query_param,
     )
 
-    # 在檢索相關文本塊後計算 Token 數量
+    # End retrieval timing after context is built
+    tracker.end_retrieve_time()
+
+    # Track retrieved data tokens
     if context:
-        token_counter.update_retrieved_data_tokens([context])
+        tracker.update_retrieved_data_tokens(context)
 
     if query_param.only_need_context:
+        tracker.end_tracking()
         return context
     if context is None:
+        tracker.end_tracking()
         return PROMPTS["fail_response"]
     sys_prompt_temp = PROMPTS["rag_response"]
     sys_prompt = sys_prompt_temp.format(
         context_data=context, response_type=query_param.response_type
     )
 
-    # 計算系統提示的 Token 數量
-    token_counter.update_system_prompt_tokens(sys_prompt)
-
     if query_param.only_need_prompt:
+        tracker.end_tracking()
         return sys_prompt
 
-    # 計算完整提示的 Token 數量
+    # Build full prompt and track tokens
     full_prompt = f"{sys_prompt}\n\n{query}"
-    token_counter.update_total_prompt_tokens(full_prompt)
+    tracker.update_inference_input_tokens(full_prompt)
 
-    # 獲取 LLM 回應
+    # Start LLM time measurement
+    tracker.start_llm_time()
+
+    # Get LLM response
     response = await use_model_func(
         query,
         system_prompt=sys_prompt,
         stream=query_param.stream,
     )
 
-    # 處理回應
+    # End LLM time measurement
+    tracker.end_llm_time()
+
+    # Process response
     if isinstance(response, str) and len(response) > len(sys_prompt):
         response = (
             response.replace(sys_prompt, "")
@@ -703,14 +732,21 @@ async def kg_query(
             .replace("</system>", "")
             .strip()
         )
+        # Track completion tokens
+        tracker.update_inference_output_tokens(response)
 
-    # 計算回應的 Token 數量
-    token_counter.update_completion_tokens(response)
+    # End total time tracking
+    tracker.end_tracking()
 
-    # 獲取 Token 統計信息
-    token_stats = token_counter.get_stats()
+    # Get performance statistics
+    token_stats = tracker.get_token_stats()
+    time_stats = tracker.get_time_stats()
+    performance_stats = {
+        "token_stats": token_stats,
+        "time_stats": time_stats
+    }
 
-    # 保存到緩存
+    # Save to cache
     await save_to_cache(
         hashing_kv,
         CacheData(
@@ -721,26 +757,26 @@ async def kg_query(
             min_val=min_val,
             max_val=max_val,
             mode=query_param.mode,
-            token_stats=token_stats,  # 添加 Token 統計信息
+            performance_stats=performance_stats,
         ),
     )
 
     if isinstance(response, str):
         if query_param.stream:
-            # 如果是流式模式，返回異步迭代器
+            # For streaming mode, return async generator
             async def wrapped_generator():
                 yield response
-                yield {"token_stats": token_stats}
+                yield {"performance_stats": performance_stats}
             return wrapped_generator()
         else:
-            # 如果不是流式模式，返回字典
-            return {"response": response, "token_stats": token_stats}
+            # For non-streaming mode, return dictionary
+            return {"response": response, "performance_stats": performance_stats}
     else:
-        # 如果已經是異步迭代器，包裝它以在最後添加 Token 統計信息
+        # If already an async iterator, wrap it to include performance stats at the end
         async def wrapped_generator():
             async for chunk in response:
                 yield chunk
-            yield {"token_stats": token_stats}
+            yield {"performance_stats": performance_stats}
         return wrapped_generator()
 
 
@@ -1451,11 +1487,14 @@ async def naive_query(
     global_config: dict,
     hashing_kv: BaseKVStorage = None,
 ):
-    # 初始化 TokenCounter
-    token_counter = TokenCounter(model_name=global_config.get("llm_model", "gpt-4o"))
-
-    # 計算查詢的 Token 數量
-    token_counter.update_query_tokens(query)
+    # Initialize RAGPerformanceTracker
+    tracker = RAGPerformanceTracker(model_name=global_config.get("llm_model", "gpt-4o-mini"))
+    
+    # Start timing the entire process
+    tracker.start_tracking()
+    
+    # Track query tokens
+    tracker.update_query_tokens(query)
 
     # Handle cache
     use_model_func = global_config["llm_model_func"]
@@ -1464,10 +1503,17 @@ async def naive_query(
         hashing_kv, args_hash, query, query_param.mode
     )
     if cached_response is not None:
+        # End tracking early for cached responses
+        tracker.end_tracking()
         return cached_response
 
+    # Start retrieval timing
+    tracker.start_retrieve_time()
+    
     results = await chunks_vdb.query(query, top_k=query_param.top_k)
     if not len(results):
+        tracker.end_retrieve_time()
+        tracker.end_tracking()
         return PROMPTS["fail_response"]
 
     chunks_ids = [r["id"] for r in results]
@@ -1480,6 +1526,8 @@ async def naive_query(
 
     if not valid_chunks:
         logger.warning("No valid chunks found after filtering")
+        tracker.end_retrieve_time()
+        tracker.end_tracking()
         return PROMPTS["fail_response"]
 
     maybe_trun_chunks = truncate_list_by_token_size(
@@ -1490,16 +1538,22 @@ async def naive_query(
 
     if not maybe_trun_chunks:
         logger.warning("No chunks left after truncation")
+        tracker.end_retrieve_time()
+        tracker.end_tracking()
         return PROMPTS["fail_response"]
 
     logger.info(f"Truncate {len(chunks)} to {len(maybe_trun_chunks)} chunks")
     section = "\n--New Chunk--\n".join([c["content"] for c in maybe_trun_chunks])
+    
+    # End retrieval timing
+    tracker.end_retrieve_time()
 
-    # 計算檢索數據的 Token 數量
+    # Track retrieved data tokens
     chunk_texts = [c["content"] for c in maybe_trun_chunks]
-    token_counter.update_retrieved_data_tokens(chunk_texts)
+    tracker.update_retrieved_data_tokens(chunk_texts)
 
     if query_param.only_need_context:
+        tracker.end_tracking()
         return section
 
     sys_prompt_temp = PROMPTS["naive_rag_response"]
@@ -1507,25 +1561,29 @@ async def naive_query(
         content_data=section, response_type=query_param.response_type
     )
 
-    # 計算系統提示的 Token 數量
-    token_counter.update_system_prompt_tokens(sys_prompt)
+    # Track system prompt tokens
+    tracker.update_inference_input_tokens(sys_prompt)
 
     if query_param.only_need_prompt:
+        tracker.end_tracking()
         return sys_prompt
 
-    # 計算完整提示的 Token 數量
-    full_prompt = f"{sys_prompt}\n\n{query}"
-    token_counter.update_total_prompt_tokens(full_prompt)
-
+    # Start LLM time measurement
+    tracker.start_llm_time()
+    
+    # Get LLM response
     response = await use_model_func(
         query,
         system_prompt=sys_prompt,
     )
+    
+    # End LLM time measurement
+    tracker.end_llm_time()
 
-    if len(response) > len(sys_prompt):
+    # Process response
+    if isinstance(response, str) and len(response) > len(sys_prompt):
         response = (
-            response[len(sys_prompt) :]
-            .replace(sys_prompt, "")
+            response.replace(sys_prompt, "")
             .replace("user", "")
             .replace("model", "")
             .replace(query, "")
@@ -1533,12 +1591,19 @@ async def naive_query(
             .replace("</system>", "")
             .strip()
         )
+        # Track completion tokens
+        tracker.update_inference_output_tokens(response)
 
-    # 計算回應的 Token 數量
-    token_counter.update_completion_tokens(response)
+    # End total time tracking
+    tracker.end_tracking()
 
-    # 獲取 Token 統計信息
-    token_stats = token_counter.get_stats()
+    # Get performance statistics
+    token_stats = tracker.get_token_stats()
+    time_stats = tracker.get_time_stats()
+    performance_stats = {
+        "token_stats": token_stats,
+        "time_stats": time_stats
+    }
 
     # Save to cache
     await save_to_cache(
@@ -1551,26 +1616,26 @@ async def naive_query(
             min_val=min_val,
             max_val=max_val,
             mode=query_param.mode,
-            token_stats=token_stats,  # 添加 Token 統計信息
+            performance_stats=performance_stats,
         ),
     )
 
     if isinstance(response, str):
         if query_param.stream:
-            # 如果是流式模式，返回異步迭代器
+            # For streaming mode, return async generator
             async def wrapped_generator():
                 yield response
-                yield {"token_stats": token_stats}
+                yield {"performance_stats": performance_stats}
             return wrapped_generator()
         else:
-            # 如果不是流式模式，返回字典
-            return {"response": response, "token_stats": token_stats}
+            # For non-streaming mode, return dictionary
+            return {"response": response, "performance_stats": performance_stats}
     else:
-        # 如果已經是異步迭代器，包裝它以在最後添加 Token 統計信息
+        # If already an async iterator, wrap it to include performance stats at the end
         async def wrapped_generator():
             async for chunk in response:
                 yield chunk
-            yield {"token_stats": token_stats}
+            yield {"performance_stats": performance_stats}
         return wrapped_generator()
 
 
@@ -1593,11 +1658,14 @@ async def mix_kg_vector_query(
     2. Retrieving relevant text chunks through vector similarity
     3. Combining both results for comprehensive answer generation
     """
-    # 初始化 TokenCounter
-    token_counter = TokenCounter(model_name=global_config.get("llm_model", "gpt-4o"))
-
-    # 計算查詢的 Token 數量
-    token_counter.update_query_tokens(query)
+    # Initialize RAGPerformanceTracker
+    tracker = RAGPerformanceTracker(model_name=global_config.get("llm_model", "gpt-4o-mini"))
+    
+    # Start timing the entire process
+    tracker.start_tracking()
+    
+    # Track query tokens
+    tracker.update_query_tokens(query)
 
     # 1. Cache handling
     use_model_func = global_config["llm_model_func"]
@@ -1606,7 +1674,12 @@ async def mix_kg_vector_query(
         hashing_kv, args_hash, query, "mix"
     )
     if cached_response is not None:
+        # End tracking early for cached responses
+        tracker.end_tracking()
         return cached_response
+
+    # Start retrieval timing
+    tracker.start_retrieve_time()
 
     # 2. Execute knowledge graph and vector searches in parallel
     async def get_kg_context():
@@ -1617,8 +1690,7 @@ async def mix_kg_vector_query(
                 PROMPTS["keywords_extraction_examples"]
             ):
                 examples = "\n".join(
-                    PROMPTS["keywords_extraction_examples"][: int(example_number)]
-                )
+                    PROMPTS["keywords_extraction_examples"][: int(example_number)])
             else:
                 examples = "\n".join(PROMPTS["keywords_extraction_examples"])
 
@@ -1630,6 +1702,10 @@ async def mix_kg_vector_query(
             kw_prompt = PROMPTS["keywords_extraction"].format(
                 query=query, examples=examples, language=language
             )
+            
+            # Track keywords extraction prompt tokens
+            tracker.update_retrieval_prompt_tokens(kw_prompt)
+            
             result = await use_model_func(kw_prompt, keyword_extraction=True)
 
             match = re.search(r"\{.*\}", result, re.DOTALL)
@@ -1729,21 +1805,26 @@ async def mix_kg_vector_query(
     kg_context, vector_context = await asyncio.gather(
         get_kg_context(), get_vector_context()
     )
+    
+    # End retrieval timing
+    tracker.end_retrieve_time()
 
     # 4. Merge contexts
     if kg_context is None and vector_context is None:
+        tracker.end_tracking()
         return PROMPTS["fail_response"]
 
     if query_param.only_need_context:
+        tracker.end_tracking()
         return {"kg_context": kg_context, "vector_context": vector_context}
 
-    # 計算檢索數據的 Token 數量
+    # Track retrieved data tokens
     retrieved_texts = []
     if kg_context:
         retrieved_texts.append(kg_context)
     if vector_context:
         retrieved_texts.append(vector_context)
-    token_counter.update_retrieved_data_tokens(retrieved_texts)
+    tracker.update_retrieved_data_tokens(retrieved_texts)
 
     # 5. Construct hybrid prompt
     sys_prompt = PROMPTS["mix_rag_response"].format(
@@ -1756,22 +1837,25 @@ async def mix_kg_vector_query(
         response_type=query_param.response_type,
     )
 
-    # 計算系統提示的 Token 數量
-    token_counter.update_system_prompt_tokens(sys_prompt)
+    # Track system prompt tokens
+    tracker.update_inference_input_tokens(sys_prompt)
 
     if query_param.only_need_prompt:
+        tracker.end_tracking()
         return sys_prompt
 
-    # 計算完整提示的 Token 數量
-    full_prompt = f"{sys_prompt}\n\n{query}"
-    token_counter.update_total_prompt_tokens(full_prompt)
-
+    # Start LLM time measurement
+    tracker.start_llm_time()
+    
     # 6. Generate response
     response = await use_model_func(
         query,
         system_prompt=sys_prompt,
         stream=query_param.stream,
     )
+    
+    # End LLM time measurement
+    tracker.end_llm_time()
 
     # Clean up the response
     if isinstance(response, str) and len(response) > len(sys_prompt):
@@ -1784,12 +1868,19 @@ async def mix_kg_vector_query(
             .replace("</system>", "")
             .strip()
         )
+        # Track completion tokens
+        tracker.update_inference_output_tokens(response)
 
-    # 計算回應的 Token 數量
-    token_counter.update_completion_tokens(response)
+    # End total time tracking
+    tracker.end_tracking()
 
-    # 獲取 Token 統計信息
-    token_stats = token_counter.get_stats()
+    # Get performance statistics
+    token_stats = tracker.get_token_stats()
+    time_stats = tracker.get_time_stats()
+    performance_stats = {
+        "token_stats": token_stats,
+        "time_stats": time_stats
+    }
 
     # 7. Save cache
     await save_to_cache(
@@ -1802,24 +1893,24 @@ async def mix_kg_vector_query(
             min_val=min_val,
             max_val=max_val,
             mode="mix",
-            token_stats=token_stats,  # 添加 Token 統計信息
+            performance_stats=performance_stats,
         ),
     )
 
     if isinstance(response, str):
         if query_param.stream:
-            # 如果是流式模式，返回異步迭代器
+            # For streaming mode, return async generator
             async def wrapped_generator():
                 yield response
-                yield {"token_stats": token_stats}
+                yield {"performance_stats": performance_stats}
             return wrapped_generator()
         else:
-            # 如果不是流式模式，返回字典
-            return {"response": response, "token_stats": token_stats}
+            # For non-streaming mode, return dictionary
+            return {"response": response, "performance_stats": performance_stats}
     else:
-        # 如果已經是異步迭代器，包裝它以在最後添加 Token 統計信息
+        # If already an async iterator, wrap it to include performance stats at the end
         async def wrapped_generator():
             async for chunk in response:
                 yield chunk
-            yield {"token_stats": token_stats}
+            yield {"performance_stats": performance_stats}
         return wrapped_generator()

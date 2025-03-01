@@ -515,12 +515,12 @@ class CacheData:
         args_hash,
         content,
         prompt,
-        quantized,
-        min_val,
-        max_val,
-        mode,
+        quantized=None,
+        min_val=None,
+        max_val=None,
+        mode="default",
         cache_type=None,
-        token_stats=None
+        performance_stats=None
     ):
         self.args_hash = args_hash
         self.content = content
@@ -530,7 +530,7 @@ class CacheData:
         self.max_val = max_val
         self.mode = mode
         self.cache_type = cache_type
-        self.token_stats = token_stats
+        self.performance_stats = performance_stats
 
 
 async def save_to_cache(hashing_kv, cache_data: CacheData):
@@ -556,6 +556,7 @@ async def save_to_cache(hashing_kv, cache_data: CacheData):
         "embedding_min": cache_data.min_val,
         "embedding_max": cache_data.max_val,
         "original_prompt": cache_data.prompt,
+        "performance_stats": cache_data.performance_stats,
     }
 
     await hashing_kv.upsert({cache_data.mode: mode_cache})
