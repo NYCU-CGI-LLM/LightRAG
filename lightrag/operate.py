@@ -587,7 +587,7 @@ async def kg_query(
     # Handle cache
     use_model_func = global_config["llm_model_func"]
     args_hash = compute_args_hash(query_param.mode, query)
-    cached_response, quantized, min_val, max_val, mode = await handle_cache(
+    cached_response, quantized, min_val, max_val = await handle_cache(
         hashing_kv, args_hash, query, query_param.mode
     )
     if cached_response is not None:
